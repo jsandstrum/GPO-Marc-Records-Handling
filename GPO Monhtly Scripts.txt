@@ -1,0 +1,886 @@
+
+***************************************************************************************************
+** Shell script for calling perl scripts to retrieve and break up file by format and University   *
+** written by Cindy Fox                                                                           *
+***************************************************************************************************
+NOTE** -- directories, server names, username info has been replaced by {**secure info**}
+
+#!/bin/tcsh
+# gpo_retrieve
+
+# Written by Cindy Fox - August 2022
+
+# This script retrieves files from the Marcive ftp site. It runs a Perl script
+# that downloads files from the vendor's site to {**secure info**}/gpo_temp. The script
+# then checks to see if the files have been downloaded before. This is tracked
+# by a set of empty files in{**secure info**}/gpo_touch. If the file name does not exist
+# in the touch directory, it is moved to {**secure info**}/gpo_monthly. Then it runs a
+# Perl script to split the file out for each institution and moves the files to the
+# {**secure info**}/gpo institution directories. Then the files are copied to the securefiles ftp
+# server for each institution listed in {**secure info**}/gpo/inst_info so they can be retrieved
+# and loaded into Alma. An email is also sent to the loadfiles group.
+# The log file is called gpo_retrieve_YYYYMMDDHM.log and the error log is called
+# gpo_error_YYYYMMDDHM.log, they are both located in the {**secure info**}/cron_logs directory.
+
+# Dependencies
+# inst_info file - contains a list of the instutions to process
+
+set send_flag = 0
+set mail_to = {**secure info**}
+set retrieve_log = {**secure info**}/gpo_retrieve_`date +%Y%m%d%H%M`.log
+set error_log = {**secure info**}/gpo_error_`date +%Y%m%d%H%M`.log
+set gpo_dir = {**secure info**}
+set inst_info = $gpo_dir/inst_info
+set touchdir = $gpo_dir/gpo_touch
+set tempdir = $gpo_dir/gpo_temp
+set mail_notify = {**secure info**}
+set today = `date +%Y%m%d`
+set output_file = $gpo_dir/gpo_monthly/gpom_output.$today
+
+if ( ! -f $inst_info ) then
+   echo "$inst_info file missing" >> $error_log
+   mailx -s "GPO Retrieve: $inst_info file missing on `uname -n`" $mail_to < /dev/null >& /dev/null
+   exit
+endif
+
+echo "------------------------------------------------------------" >> $retrieve_log
+echo "Starting GPO-Marcive retrieve" >> $retrieve_log
+echo "------------------------------------------------------------" >> $retrieve_log
+
+# This Perl script will download all monthly files from the Marcive site
+perl {**secure info**}/gpo_monthly_sftp.pl
+
+if ( $status != 0 ) then
+   echo "GPO Retrieve: gpo_monthly_sftp.pl Script FAILED on `uname -n`" >> $error_log
+   mailx -s "GPO Retrieve: gpo_monthly_sftp.pl Script FAILED on `uname -n`" $mail_to < /dev/null >& /dev/null
+   exit
+endif
+
+foreach tempfile ( `/bin/ls $tempdir` )
+   if ( ! -f $touchdir/$tempfile ) then
+      cp -f $tempdir/$tempfile $gpo_dir/gpo_monthly
+      echo "$tempfile was copied to the $gpo_dir/gpo_monthly directory for processing" >> $retrieve_log
+
+# This Perl script will split out the one monthly file to multiple files for each institution
+      perl {**secure info**}/gpo_monthly.pl $gpo_dir/gpo_monthly/$tempfile
+
+      if ( $status != 0 ) then
+         echo "GPO Retrieve: gpo_monthly.pl Script FAILED on `uname -n`" >> $error_log
+         mailx -s "GPO Retrieve: gpo_monthly.pl Script FAILED on `uname -n`" $mail_to < /dev/null >& /dev/null
+         exit
+      endif
+
+# sftp each institution's files to securefiles for Alma to pick up
+      foreach inst ( `cat $inst_info` )
+         echo "put $gpo_dir/$inst/*_$today.mrc" | sftp -b- f{**secure info**}:gpo/gpo_monthly/$inst
+
+         if ( $status != 0 ) then
+            echo "GPO Retrieve: SFTP to securefiles FAILED for $inst on `uname -n`" >> $error_log
+            mailx -s "GPO Retrieve: SFTP to securefiles FAILED for $inst on `uname -n`" $mail_to < /dev/null >& /dev/null
+            exit
+         endif
+
+         echo `date`,$gpo_dir/$inst/"*_"$today".mrc",copied to securefiles:/gpo_monthly/$inst >> $retrieve_log
+         touch $touchdir/$tempfile
+      end
+   else
+      echo `date`,$tempfile,skipped already downloaded >> $retrieve_log
+   endif
+end
+
+/bin/rm -f $tempdir/* >& /dev/null
+
+if ( -f $output_file ) then
+   cat $output_file | mutt -s "GPO monthly file was processed" $mail_notify
+endif
+
+exit:
+   echo "------------------------------------------------------------" >> $retrieve_log
+   echo "ALL DONE" >> $retrieve_log
+   echo "------------------------------------------------------------" >> $retrieve_log
+   exit
+************************************************************************************************************************
+
+***************************************************************************
+** gpo_monthly_sftp.pl -Perl script retrieves gpo files                   *
+** written by John Sandstrum
+***************************************************************************
+NOTE** -- directories, server names, username info has been replaced by {**secure info**}
+
+#!/usr/bin/perl
+#
+# Goes to marcive to pick up gpo monthly files.
+# js -- 20220831 - 202220902
+
+use strict;
+use warnings;
+use Net::SFTP::Foreign;
+#use IO::Pty;
+my $host     = "{**secure info**}";
+my $serv_dir = "output/{**secure info**}";
+my $username = "{**secure info**}";
+my $password = "{**secure info**}";
+my $local_dir = "/{**secure info**}";
+
+my $sftp = Net::SFTP::Foreign::->new($host, user=>$username, password=>$password, more => '-v');
+$sftp->die_on_error("Unable to establish SFTP connection") , $sftp->error;  # connect
+$sftp->setcwd($serv_dir) or die "unable to change cwd: " . $sftp->error;     # set path
+$sftp->mget("FLVCM*.mrc", $local_dir) or die "get failed: " . $sftp->error;             # get file
+$sftp->disconnect;                                                          # log off
+undef $sftp;
+******************************************************************************************************************************
+
+***************************************************************************
+** gpo_monthly.pl -Perl script to break up gpo files by university        *
+** and format                                                             *
+** written by John Nowlin and John Sandstrum                              *
+***************************************************************************
+NOTE** -- directories, server names, username info has been replaced by {**secure info**}
+
+#!/usr/bin/perl
+#
+# read through a marc file supplied by an universities splitting into multiple files
+# based on different field values
+
+# to add another university.
+#   add the MARC fields variable near 50
+#   add the MARC field values to the build_marc_fields() subroutine
+#   add the college code to the list near 80
+#       my %fileCounts = ();
+#       foreach my $key ('fau','gcu','cfu','ufu','wfu') {
+#   add the 049 value to the if/elsif switch statement near 112
+#
+# Modifications
+# 20140721 -- Changed UFDOC in $852 $$b from UFDOC to UFSTO : UF moved collection -- J.S.
+# 20150424 -- Changed  "b => 'UFSTO', c => 'GEN'" to " b => 'UFSTO', c => 'GOV'" per Mary Ann -- J.S.
+# 20180904 -- added "on" to OCLC prefixes to replace -- j.s.
+# 20190604 -- Forcing NFU $852 field 1st indicator '3' -- j.s.
+# 20200506 -- Changed NFU $852 $$t from '90' to '95' per Elaine -- js
+# 20211020 -- Changed to print out by format -- js
+# 20211103 -- Changed CFU to have 8523_, and MF is now t=31 in lieu of 01, per library -- js
+# 20220419 -- Added maps and audio cd to fiu -- js
+# 20220512 -- Changed cfu_do to cfu_er to better describe electronic works, per Melissa -- js
+# 20220815 -- Changed sfu_ss to sfu_er and now looking for 008 pos. 23 'o' -- js
+# 20220822 -- Changed sfu to catch cd-roms sfu_cd -- js
+# 20220831 -- Changed output folder from /{**secure info**}/gpo_files to /{**secure info**}/gpo_monthly -- js
+# 20220906 -- Changed all references to old code to New Alma codes -- js
+use strict;
+use warnings;
+
+#use lib '/usr/local/share/perl5/MARC/';
+use MARC::Batch;
+use MARC::File::XML ( BinaryEncoding => 'utf8', RecordFormat => 'USMARC' );
+use MARC::Field;
+use MARC::Record;
+use File::Basename;
+use POSIX 'strftime';
+use locale;
+
+# go fetch the parameters passed in to this program
+my ($directoryAndFile) = readLineParameters();
+
+my($filename, $directory) = fileparse($directoryAndFile);
+
+if ( ! -f $directoryAndFile ) {
+        die "$0: can't find $directoryAndFile\n";
+}
+
+my $batch = MARC::Batch->new( 'USMARC', $directoryAndFile );
+
+my $inRecordCnt = 0;
+
+my $todays_date = strftime '%Y%m%d', localtime;
+
+my ($marc, $marcIn, $marcTemp);
+
+my ($subFieldsChecked, $putMarcRecord);
+my ($field074mf, $field074on);
+my ($isElectronic, $isMicro, $isMap);  # added IsMap -- js 20220420
+#my $field008osq;
+
+# add emtpy array values here for each college
+my (@fau_er_marc_fields, @fau_mf_marc_fields, @fau_do_marc_fields);
+my (@fiu_cd_marc_fields, @fiu_ej_marc_fields, @fiu_er_marc_fields, @fiu_mf_marc_fields, @fiu_us_marc_fields);
+my (@fiu_au_marc_fields, @fiu_mp_marc_fields);
+my (@fgcu_marc_fields);
+my (@ucf_md_marc_fields, @ucf_er_marc_fields, @ucf_mp_marc_fields, @ucf_us_marc_fields, @ucf_mf_marc_fields);
+my (@ufl_er_marc_fields, @ufl_do_marc_fields, @ufl_mf_marc_fields, @ufl_mp_marc_fields, @ufl_dm_marc_fields, @ufl_gm_marc_fields, @ufl_sm_marc_fields);
+my (@usf_cd_marc_fields, @usf_er_marc_fields, @usf_mp_marc_fields, @usf_mc_marc_fields, @usf_cc_marc_fields);
+my (@famu_el_marc_fields, @famu_ce_marc_fields, @famu_na_marc_fields, @famu_em_marc_fields, @famu_ff_marc_fields, @famu_mm_marc_fields, @famu_ma_marc_fields);
+my (@uwf_er_marc_fields, @uwf_mf_marc_fields, @uwf_do_marc_fields);
+my (@unf_er_marc_fields);
+
+build_marc_fields();
+
+# add college code here to open the file and count records
+#my $key2 = "amu";
+my $keyabr = "amu";
+my (%files, %fileCounts, %marcCounts) = ();
+foreach my $key ('famu_em','famu_ce','famu_na','famu_el','famu_ff','famu_mm','fau_er','fau_mf','fau_do','fgcu_er','ucf_md','ucf_er','ucf_mp','ucf_mf','ucf_us','ufl_er','ufl_mf','ufl_do','ufl_er','ufl_sm','ufl_gm','ufl_mp','ufl_dm','usf_cd','usf_er','usf_mp','usf_mc','usf_cc','uwf_er','uwf_mf','uwf_do','fiu_cd','fiu_ej','fiu_er','fiu_mf','fiu_us',
+'fiu_au','fiu_mp','unf_er') {
+        if (substr($key,0,3) eq 'fam' || substr($key,0,3) eq 'fgc') {
+            $keyabr = substr($key,0,4); }
+    else {
+            $keyabr = substr($key,0,3); }
+    local *FILE;
+    open (FILE, '> :utf8', "{**secure info**}/" . $keyabr . "/" . $key . '01_' . $todays_date . '.mrc')
+        or die "$! $key";
+    $files{$key} = *FILE;
+    $fileCounts{$key} = 0;
+}
+
+# debug
+#my $file = MARC::File::XML->out( 'myfile.xml' );
+#debug
+
+# read through the input file
+while ( $marcIn = $batch->next) {
+    $inRecordCnt++;
+
+    #print "\n** MARC input **\n" . $marcIn->as_formatted();
+    #if ($inRecordCnt == 40) {exit};
+
+    $marcTemp = '';
+    $subFieldsChecked = 0;
+
+    # loop through each 049 college code
+    for my $field049 ($marcIn->field('049')) {
+
+        my $field049a = $field049->subfield('a');
+        $putMarcRecord = 0;
+
+        # add individual 049 college codes here, sometimes only need 1st 2 characters
+        if ($field049a eq 'FGAF') {
+            fgcu($field049a);
+        }
+        elsif ($field049a eq 'FGMD') {
+           fau($field049a);
+        }
+        elsif ($field049a eq 'FTUG') {
+            ucf($field049a);
+        }
+        elsif ($field049a eq 'FHMI') {
+            usf($field049a);
+        }
+        elsif ($field049a =~ /FCMD|FCMV/){
+            famu($field049a);
+        }
+        elsif ($field049a eq 'FXGX'){
+            fiu($field049a);
+        }
+        elsif (substr($field049a, 0, 2) eq 'FU' || $field049a eq 'FLGF') {
+            ufl($field049a);
+        }
+        elsif (substr($field049a, 0, 2) eq 'FW') {
+           uwf($field049a);
+        }
+                elsif ($field049a eq 'FNPU') {
+            unf($field049a);
+        }
+    }
+}
+
+my $outfile;
+open ($outfile, '>', "/{**secure info**}/gpom_output.$todays_date")
+        or die "$! can't print file counts";
+
+print $outfile "File Record Counts
+    $directoryAndFile Input => $inRecordCnt
+    Output:\n";
+
+while ( my ($key, $file) = each(%files) ) {
+    print $outfile "\t$key =>\t$fileCounts{$key}\n";
+    close $file;
+}
+
+
+print $outfile "\nMarc Record Counts\n";
+foreach (sort keys %marcCounts) {
+    print $outfile "\t$_ =>\t$marcCounts{$_}\n";
+}
+close $outfile;
+
+sub putMarcRecord {
+    my ($college, $marcFields) = @_;
+    $putMarcRecord = 1;
+
+    my $marcLocal = $marc->clone();
+    $marcLocal->insert_fields_ordered(@$marcFields);
+    local *FILE = $files{$college}; # error on this line? missing collge from %files hash @ line 58?
+    $marcLocal->encoding('MARC-8');
+    print FILE $marcLocal->as_usmarc();
+    $fileCounts{$college}++;
+
+    my $marcType = $marcLocal->subfield('049','a');
+    if (exists $marcCounts{$marcType}) {
+        $marcCounts{$marcType}++;
+    }
+    else {
+        $marcCounts{$marcType}=1;
+    }
+
+    #debug print "\n** MARC output $college **\n" . $marcLocal->as_formatted();
+}
+
+sub subFieldContains {
+    my $marcRecord = shift;
+    my $fieldNumber = shift;
+
+}
+# if not already cloned for this marc record, clone the marc record to a temp record
+# do some generic cleanup. college subroutines then clone this clone to
+# make college specific changes
+sub createMarcClone {
+    if ($marcTemp eq '') {
+        $marcTemp = $marcIn->clone();
+
+        # convert the 001 field to a 035 field
+        my $field035 = $marcTemp->field('001')->data();
+        $field035 =~ s/(ocm|ocn|oc|on)/\(OCoLC\)/;
+        $field035 = MARC::Field->new( '035', ' ', ' ', a => $field035);
+
+        $marcTemp->delete_fields($marcTemp->field('001'),$marcTemp->field('003'),$marcTemp->field('049'));
+        $marcTemp->insert_fields_ordered($field035);
+    };
+    $marc = $marcTemp->clone();
+}
+
+# these subfields are fairly commonly checked by the college specific subroutines
+# so we create booleans to make the code cleaner
+sub checkSubFields {
+    if (!$subFieldsChecked) {
+        $subFieldsChecked = 1;
+        $field074mf = 0;
+        $field074on = 0;
+
+        my $field245h = lc ($marcIn->subfield('245', 'h') || '');
+        $isElectronic = index($field245h, '[electronic') > -1 ;
+        $isMicro =  index($field245h, '[micro') > -1;
+
+        for my $field074 ($marc->field('074')) {
+            my $field074a =  lc ($field074->subfield('a') || ' ');
+            $field074mf = $field074mf || index($field074a, '(mf)') > -1;
+            $field074on = $field074on || index($field074a, '(online)') > -1;
+            $isElectronic = $isElectronic || $field074on;
+            $isMicro =  $isMicro || $field074mf;
+        }
+
+        if (!$isElectronic && !$isMicro) {
+            for my $field338 ($marcIn->field('338')) {
+                my $field338a = lc ($field338->subfield('a') || '');
+                my $field338b = lc ($field338->subfield('h') || '');
+                $isElectronic = $isElectronic || (index($field338a, 'online') > -1) || (index($field338b, 'cr') > -1);
+                $isMicro =  $isMicro || (index($field338a, 'micro') > -1) || (substr($field338b, 0, 1) eq 'h');
+            }
+        }
+
+        # does 008 position 23 contain o, s, or q
+        #$field008osq = index('osq', lc substr($marcIn->field('008')->data(), 23, 1)) > -1;
+    }
+}
+
+#college specific subroutines. each college librarian does things differently.
+#this is the curse of working with librarians. they have the nationally defined
+#marc record which they polute and then use uniquely.
+sub famu {
+    my $f49a = shift;
+    createMarcClone();
+    checkSubFields();
+
+    if (($marc->subfield('300', 'a') || '') =~ /DVD|CD|computer/i) {
+        putMarcRecord ('famu_em', \@famu_em_marc_fields);
+        return;
+    }
+
+    if ($isElectronic) {
+        if (index(lc ($marc->subfield('362', 'a') || ''),'ceased')>-1) {
+            putMarcRecord('famu_ce', \@famu_ce_marc_fields);
+            return;
+        }
+
+        for my $f856 ($marc->field('856')) {
+            if ((index(lc ($f856->subfield('3') || ''), 'no longer')>-1) || (index(lc ($f856->subfield('z') || ''), 'no longer')>-1)) {
+                putMarcRecord ('famu_na', \@famu_na_marc_fields);
+                return;
+            }
+        }
+
+        putMarcRecord ('famu_el', \@famu_el_marc_fields);
+        return;
+    }
+
+
+    if ($f49a eq 'FCMD') {
+        if ( substr($marc->leader(), 6, 1) eq 'e') {
+           putMarcRecord ('famu_ma', \@famu_ma_marc_fields);
+           return;
+        }
+
+        putMarcRecord ('famu_ff', \@famu_ff_marc_fields);
+    }
+
+    elsif ($f49a eq 'FCMV') {
+        if ($isMicro && substr($marc->leader(), 6, 1) ne 'e') {
+            putMarcRecord ('famu_mm', \@famu_mm_marc_fields);
+        }
+    }
+}
+
+sub fau {
+    createMarcClone();
+    checkSubFields();
+    $marc->delete_fields($marc->field('029'),$marc->field('850'),$marc->field('891'));
+
+    if ($isElectronic)  {
+        putMarcRecord ('fau_er', \@fau_er_marc_fields);
+    }
+
+    if ($isMicro) {
+        putMarcRecord ('fau_mf', \@fau_mf_marc_fields);
+    }
+
+        if (! $putMarcRecord) {
+        putMarcRecord ('fau_do', \@fau_do_marc_fields);
+    }
+}
+
+sub fgcu {
+    createMarcClone();
+    putMarcRecord ('fgcu_er', \@fgcu_marc_fields);
+}
+
+sub fiu {
+        createMarcClone();
+        checkSubFields();
+        $marc->delete_fields($marc->field('029'),$marc->field('850'),$marc->field('891'));
+
+        if (($marc->subfield('300', 'a') || '') =~ /DVD|CD-ROM|CDROM|computer optical dis|computer dis|audio/) {
+                putMarcRecord ('fiu_cd', \@fiu_cd_marc_fields);
+    }
+
+        if (substr($marc->leader(), 6, 1) eq 'e') {
+                putMarcRecord ('fiu_mp', \@fiu_mp_marc_fields);
+                $isMap = 1;  # add $isMap -- js 20220420
+        }
+
+        if ($field074on) {
+        if (substr($marc->leader(), 7, 1) eq 's') {
+            putMarcRecord ('fiu_ej', \@fiu_ej_marc_fields);
+        }
+        else {
+                putMarcRecord ('fiu_er', \@fiu_er_marc_fields);
+        }
+        }
+
+    # TODO recommend just using $isMicro
+        if ($field074mf || (index(lc ($marc->subfield('245', 'h') || ''), '[micro') > -1)) {
+                putMarcRecord ('fiu_mf', \@fiu_mf_marc_fields);
+        }
+  # Changing && to and -- js 20220420
+        if (!$isMicro and !$isElectronic and !$isMap) {   # added $isMap -- js 20220420
+                putMarcRecord ('fiu_us', \@fiu_us_marc_fields);
+        }
+}
+
+sub ucf {
+    createMarcClone();
+    checkSubFields();
+    $marc->delete_fields($marc->field('029'),$marc->field('850'),$marc->field('891'));
+
+    my $field300a = ($marc->subfield('300', 'a') || '');
+    if ($field300a =~ /DVD|CD-ROM|CDROM|computer/) {
+        putMarcRecord ('ucf_md', \@ucf_md_marc_fields);
+    }
+
+    if ($isElectronic || index($field300a, 'CD') > -1) {
+        putMarcRecord ('ucf_er', \@ucf_er_marc_fields);
+    }
+    else {
+        for my $field856 ($marc->field('856')) {
+            if (substr(lc ($field856->subfield('u') || 'will not match 856u when it is empty'), 7, 19) eq 'purl.access.gpo.gov') {
+                putMarcRecord ('ucf_er', \@ucf_er_marc_fields);
+                last;
+            }
+        }
+    }
+
+    if ((! $isElectronic ) && substr($marc->leader(), 6, 1) eq 'e') {
+        putMarcRecord ('ucf_mp', \@ucf_mp_marc_fields);
+    }
+
+    if ($isMicro) {
+        putMarcRecord ('ucf_mf', \@ucf_mf_marc_fields);
+    }
+
+    if (! $putMarcRecord) {
+        putMarcRecord ('ucf_us', \@ucf_us_marc_fields);
+    }
+}
+
+sub ufl {
+    my $f49a = shift;
+    createMarcClone();
+    checkSubFields();
+    $marc->delete_fields($marc->field('029'),$marc->field('850'),$marc->field('891'));
+
+    if ($f49a =~ /FLGF|FUDC|FUDE/) {
+        putMarcRecord ('ufl_er', \@ufl_er_marc_fields) if ($isElectronic);
+        putMarcRecord ('ufl_mf', \@ufl_mf_marc_fields) if ($isMicro);
+        putMarcRecord ('ufl_do', \@ufl_do_marc_fields) if ( !$isElectronic && !$isMicro );
+    }
+
+    elsif ($f49a =~ /FUDK|FUDL/) {
+        if ($isElectronic) {
+            putMarcRecord ('ufl_er', \@ufl_er_marc_fields);
+            putMarcRecord ('ufl_sm', \@ufl_sm_marc_fields);
+        }
+        else {
+            putMarcRecord ('ufl_gm', \@ufl_gm_marc_fields);
+        }
+    }
+
+    elsif ($f49a =~ /FUDI|FUDJ/) {
+        if ($isElectronic) {
+            putMarcRecord ('ufl_er', \@ufl_er_marc_fields);
+            putMarcRecord ('ufl_am', \@ufl_sm_marc_fields);
+        }
+        else {
+            putMarcRecord ('ufl_gm', \@ufl_gm_marc_fields);
+        }
+
+        putMarcRecord ('ufl_mf', \@ufl_mf_marc_fields) if ($isMicro);
+        putMarcRecord ('ufl_do', \@ufl_do_marc_fields) if ( !$isElectronic && !$isMicro );
+    }
+
+    elsif ($f49a eq 'FUDD') {
+        putMarcRecord ('ufl_mp', \@ufl_mp_marc_fields);
+    }
+
+    elsif ($f49a eq 'FUDH') {
+        putMarcRecord ('ufl_mp', \@ufl_mp_marc_fields);
+
+        if (! $isMicro) {
+            putMarcRecord ('ufl_dm', \@ufl_dm_marc_fields);
+        }
+    }
+}
+
+sub usf {
+    createMarcClone();
+    checkSubFields();
+
+    if (index(lc ($marcIn->subfield('245', 'h') || ''), '[electronic') > -1 ) {
+        if (($marc->subfield('300', 'a') || '') =~ /DVD|CD|computer optical dis|computer dis/i) {
+            putMarcRecord ('usf_cd', \@usf_cd_marc_fields);
+        }
+
+        if ($field074on) {
+            putMarcRecord ('usf_er', \@usf_er_marc_fields);
+        }
+    }
+    elsif (substr($marc->leader(), 6, 1) eq 'e' ) {
+        putMarcRecord ('usf_mp', \@usf_mp_marc_fields);
+    }
+
+    if ($isMicro) {
+        putMarcRecord ('usf_mc', \@usf_mc_marc_fields);
+    }
+
+    if (!$isMicro && !$isElectronic && !(substr($marc->leader(), 6, 1) eq 'e' )) {
+        putMarcRecord ('usf_cc', \@usf_cc_marc_fields);
+    }
+            if (index('o', lc substr($marcIn->field('008')->data(), 23, 1)) > -1) {
+                putMarcRecord ('usf_er', \@usf_er_marc_fields);
+        }
+
+        if (($marc->subfield('300', 'a') || '') =~ /DVD|CD-ROM|CDROM|computer optical dis|computer dis/i) {
+       putMarcRecord ('usf_cd', \@usf_cd_marc_fields);
+    }
+}
+
+sub uwf {
+    my $f49a = shift;
+    createMarcClone();
+    checkSubFields();
+    $marc->delete_fields($marc->field('029'),$marc->field('850'),$marc->field('891'));
+
+    if ($f49a eq 'FWAE') {
+        putMarcRecord ('uwf_er', \@uwf_er_marc_fields);
+        putMarcRecord ('uwf_mf', \@uwf_mf_marc_fields) if ($isMicro);
+    }
+
+    elsif ($f49a eq 'FWAD') {
+        putMarcRecord ('uwf_er', \@uwf_er_marc_fields) if ($isElectronic);
+
+        if ($isMicro) {
+            putMarcRecord ('uwf_mf', \@uwf_mf_marc_fields);
+        }
+        else {
+            putMarcRecord ('uwf_do', \@uwf_do_marc_fields);
+        }
+    }
+}
+
+sub unf {
+    createMarcClone();
+        checkSubFields();
+        if ($isElectronic) {
+       putMarcRecord ('nfu_er', \@unf_er_marc_fields);
+        }
+}
+
+#preset the marc fields to be added to each type of record.
+sub build_marc_fields {
+    @fiu_cd_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'FIUSMRD'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FMFIU', b => 'FIUDC', c => 'USMRD', m => 'CFCD', t => '90'),
+        MARC::Field->new( '949', ' ', ' ', a => 'FIUSMRD'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FMFIU)GOVDOC$todays_date.FIUSMRD"),
+    );
+
+         @fiu_mp_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'FIUSMAP'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FMFIU', b => 'FIUDC', c => 'USMAP', m => 'MAP', t => '90'),
+        MARC::Field->new( '949', ' ', ' ', a => 'FIUSMAP'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FMFIU)GOVDOC$todays_date.FIUSMAP"),
+    );
+
+    @fiu_ej_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'FIELJUS'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FMFIU', b => 'FIELR', c => 'ELJUS', m => 'ONLINE', t => '95'),
+        MARC::Field->new( '949', ' ', ' ', a => 'FIELJUS'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FMFIU)GOVDOC$todays_date.FIELJUS"),
+    );
+
+    @fiu_er_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'FIELRUS'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FMFIU', b => 'FIELR', c => 'ELRUS', m => 'ONLINE', t => '95'),
+        MARC::Field->new( '949', ' ', ' ', a => 'FIELRUS'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FMFIU)GOVDOC$todays_date.FIELRUS"),
+    );
+
+    @fiu_mf_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'FIUSMFC'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FMFIU', b => 'FIUDC', c => 'USMFC', m => 'MFICH', t => '90'),
+        MARC::Field->new( '949', ' ', ' ', a => 'FIUSMC'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FMFIU)GOVDOC$todays_date.FIUSMFC"),
+    );
+
+    @fiu_us_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'FIUS'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FMFIU', b => 'FIUDC', c => 'US', m => 'BOOK', t => '30'),
+        MARC::Field->new( '949', ' ', ' ', a => 'FIUS'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FMFIU)GOVDOC$todays_date.FIUS"),
+    );
+
+    @fau_er_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'FABDE'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FBoU', b => 'FABDE', c => 'ELEC', m => 'ELEC', t => '91'),
+        MARC::Field->new( '949', ' ', ' ', a => 'FABDE'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FBoU)GOVDOC$todays_date"),
+    );
+    @fau_mf_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'FABDM'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FBoU', b => 'FABDC', c => 'MFILM', m => 'BOOK', t => '90'),
+        MARC::Field->new( '949', ' ', ' ', a => 'FABDM'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FBoU)GOVDOC$todays_date"),
+    );
+    @fau_do_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'FABDC'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FBoU', b => 'FABDC', c => 'DOC', m => 'BOOK', t => '01'),
+        MARC::Field->new( '949', ' ', ' ', a => 'FABDC'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FBoU)GOVDOC$todays_date"),
+    );
+
+    @famu_el_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'FAMEL'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FTaFA', b => 'AMCOL', c => 'DOCEL', m => 'BOOK', t => '30'),
+        MARC::Field->new( '949', ' ', ' ', a => 'FAMEL'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FTaFA)GOVDOC$todays_date"),
+    );
+   @famu_ce_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'FAMCE'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FTaFA', b => 'AMCOL', c => 'DOCEL', m => 'BOOK', t => '30'),
+        MARC::Field->new( '949', ' ', ' ', a => 'FAMCE'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FTaFA)GOVDOC$todays_date", x => "Ffamu CEASED $todays_date"),
+    );
+    @famu_na_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'FAMNA'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FTaFA', b => 'AMCOL', c => 'DOCEL', m => 'BOOK', t => '30'),
+        MARC::Field->new( '949', ' ', ' ', a => 'FAMNA'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FTaFA)GOVDOC$todays_date", x => "Ffamu NOT AVAILABLE $todays_date"),
+    );
+    @famu_em_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'FAMEM'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FTaFA', b => 'AMCOL', c => 'DOCEM', m => 'BOOK', t => '30'),
+        MARC::Field->new( '949', ' ', ' ', a => 'FAMEM'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FTaFA)GOVDOC$todays_date"),
+    );
+    @famu_ff_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'FAMFF'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FTaFA', b => 'AMCOL', c => 'DOCF', m => 'BOOK', t => '30'),
+        MARC::Field->new( '949', ' ', ' ', a => 'FAMFF'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FTaFA)GOVDOC$todays_date"),
+    );
+    @famu_mm_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'FAMMM'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FTaFA', b => 'AMCOL', c => 'DOCM', m => 'BOOK', t => '30'),
+        MARC::Field->new( '949', ' ', ' ', a => 'FAMMM'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FTaFA)GOVDOC$todays_date"),
+    );
+    @famu_ma_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'FAMMA'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FTaFA', b => 'AMCOL', c => 'DOCMA', m => 'BOOK', t => '30'),
+        MARC::Field->new( '949', ' ', ' ', a => 'FAMMA'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FTaFA)GOVDOC$todays_date"),
+    );
+
+    @fgcu_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'FGAFG'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FFmFGC', b => 'GCUMN', c => 'ELEC', m => 'BOOK', t => '01'),
+        MARC::Field->new( '949', ' ', ' ', a => 'FGAFG'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FFmFGC)GOVDOC$todays_date", b => 'new', c=> "$todays_date"),
+    );
+
+    @ucf_md_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'CFMED'),
+        MARC::Field->new( '852', '3', ' ', a => 'FOFT', b => 'CFMGC', c => 'USMED', m => 'CDROM', t => '30'),
+        MARC::Field->new( '949', ' ', ' ', a => 'CFMED'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FOFT)GOVDOC$todays_date"),
+    );
+    @ucf_er_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'CFDOC'),
+        MARC::Field->new( '852', '3', ' ', a => 'FOFT', b => 'CFELE', c => 'DOCS', m => 'BOOK', t => '95'),
+        MARC::Field->new( '949', ' ', ' ', a => 'CFDOC'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FOFT)GOVDOC$todays_date"),
+    );
+    @ucf_mp_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'CFMAP'),
+        MARC::Field->new( '852', '3', ' ', a => 'FOFT', b => 'CFMGC', c => 'USMAP', m => 'BOOK', t => '30'),
+        MARC::Field->new( '949', ' ', ' ', a => 'CFMAP'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FOFT)GOVDOC$todays_date"),
+    );
+    @ucf_us_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'ucfSD'),
+        MARC::Field->new( '852', '3', ' ', a => 'FOFT', b => 'CFMGC', c => 'USDOC', m => 'BOOK', t => '30'),
+        MARC::Field->new( '949', ' ', ' ', a => 'ucfSD'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FOFT)GOVDOC$todays_date"),
+    );
+    @ucf_mf_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'CFMFE'),
+        MARC::Field->new( '852', '3', ' ', a => 'FOFT', b => 'CFMGC', c => 'DOCMF', m => 'BOOK', t => '31'),
+        MARC::Field->new( '949', ' ', ' ', a => 'CFMFE'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FOFT)GOVDOC$todays_date"),
+    );
+
+    @ufl_er_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'UFERDOC'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FU', b => 'UFER', c => 'DOCS', m => 'ELEC', t => '95'),
+        MARC::Field->new( '949', ' ', ' ', a => 'UFERDOC'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FU)GOVDOC$todays_date"),
+    );
+    @ufl_do_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'UFDOCGN'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FU', b => 'UFSTO', c => 'GOV', m => 'BOOK', t => '01'),
+        MARC::Field->new( '949', ' ', ' ', a => 'UFDOCGN'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FU)GOVDOC$todays_date"),
+    );
+    @ufl_mf_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'UFDOCMF'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FU', b => 'UFSTO', c => 'MFE', m => 'BOOK', t => '01'),
+        MARC::Field->new( '949', ' ', ' ', a => 'UFDOCMF'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FU)GOVDOC$todays_date"),
+    );
+    @ufl_mp_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'UFMAPMP'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FU', b => 'UFMAP', c => 'MAP', m => 'BOOK', t => '01'),
+        MARC::Field->new( '949', ' ', ' ', a => 'UFMAPMP'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FU)GOVDOC$todays_date"),
+    );
+    @ufl_dm_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'UFDOCMP'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FU', b => 'UFSTO', c => 'MAPS', m => 'BOOK', t => '01'),
+        MARC::Field->new( '949', ' ', ' ', a => 'UFDOCMP'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FU)GOVDOC$todays_date"),
+    );
+    @ufl_gm_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'UFMAPGN'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FU', b => 'UFMAP', c => 'GEN', m => 'BOOK', t => '01'),
+        MARC::Field->new( '949', ' ', ' ', a => 'UFMAPGN'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FU)GOVDOC$todays_date"),
+    );
+    @ufl_sm_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'UFERSMG'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FU', b => 'UFER', c => 'SMGEN', m => 'BOOK', t => '95'),
+        MARC::Field->new( '949', ' ', ' ', a => 'UFERSMG'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FU)GOVDOC$todays_date"),
+    );
+
+    @usf_cd_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'USFCD'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FTS', b => 'SFTMP', c => 'DOCCD', m => 'DOCCD', t => '30'),
+        MARC::Field->new( '949', ' ', ' ', a => 'USFCD'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FTS)GOVDOC$todays_date"),
+    );
+    @usf_er_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'USFER'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FTS', b => 'SFERS', c => 'DOCS', m => 'EDOCS', t => '90'),
+        MARC::Field->new( '949', ' ', ' ', a => 'USFER'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FTS)GOVDOC$todays_date"),
+    );
+    @usf_mp_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'USFMP'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FTS', b => 'SFTMP', c => 'DOCMP', m => 'DOCMP', t => '30'),
+        MARC::Field->new( '949', ' ', ' ', a => 'USFMP'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FTS)GOVDOC$todays_date"),
+    );
+    @usf_mc_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'USFMC'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FTS', b => 'SFTMP', c => 'DOCMC', m => 'DOCMC', t => '90'),
+        MARC::Field->new( '949', ' ', ' ', a => 'USFMC'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FTS)GOVDOC$todays_date"),
+    );
+    @usf_cc_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'USFCC'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FTS', b => 'SFTMP', c => 'DOC', m => 'DOC', t => '30'),
+        MARC::Field->new( '949', ' ', ' ', a => 'USFCC'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FTS)GOVDOC$todays_date"),
+    );
+
+    @uwf_er_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'PDUER'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FPeU', b => 'WFPAC', c => 'PDUER', m => 'DOCSE', t => '01'),
+        MARC::Field->new( '949', ' ', ' ', a => 'PDUER'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FPeU)GOVDOC$todays_date"),
+    );
+    @uwf_mf_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'PDUMF'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FPeU', b => 'WFPAC', c => 'PDUMF', m => 'DOCSF', t => '90', z=> "In Process"),
+        MARC::Field->new( '949', ' ', ' ', a => 'PDUMF'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FPeU)GOVDOC$todays_date"),
+    );
+    @uwf_do_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'PDUST'),
+        MARC::Field->new( '852', ' ', ' ', a => 'FPeU', b => 'WFPAC', c => 'PDUST', m => 'DOCS', t => '90', z=> "On Order"),
+        MARC::Field->new( '949', ' ', ' ', a => 'PDUST'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FPeU)GOVDOC$todays_date"),
+    );
+    @unf_er_marc_fields = (
+        MARC::Field->new( '049', ' ', ' ', a => 'FNPER'),
+        MARC::Field->new( '852', '3', ' ', a => 'FJUNF', b => 'NFUCO', c => 'USELE', m => 'ELEC', t => '95'),
+        MARC::Field->new( '949', ' ', ' ', a => 'FNPER'),
+        MARC::Field->new( '998', ' ', ' ', a => "(FJUNF)GPO$todays_date"),
+    );
+}
+
+#check for the input parameters
+sub readLineParameters {
+    my $numArgs = $#ARGV + 1;
+    if ($numArgs != 1) {
+        print "Usage: $0 outputdir/inputfile\n";
+        exit;
+    }
+
+    return @ARGV;
+}
+                                                                                                                              
