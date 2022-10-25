@@ -380,8 +380,6 @@ sub checkSubFields {
 }
 
 #college specific subroutines. each college librarian does things differently.
-#this is the curse of working with librarians. they have the nationally defined
-#marc record which they polute and then use uniquely.
 sub famu {
     my $f49a = shift;
     createMarcClone();
